@@ -8,7 +8,7 @@ use std::num::NonZeroUsize;
 use comemo::{Track, Tracked, TrackedMut};
 use once_cell::unsync::Lazy;
 
-use crate::diag::{bail, At, SourceResult};
+use crate::{diag::{bail, At, SourceResult}, foundations::Context};
 use crate::engine::{Engine, Route, Sink, Traced};
 use crate::foundations::{
     Content, NativeElement, Packed, Resolve, SequenceElem, Smart, StyleChain, Styles,
@@ -664,6 +664,8 @@ pub fn layout_fragment(
         regions,
         NonZeroUsize::ONE,
         Rel::zero(),
+        false,
+        content.location(),
     )
 }
 
@@ -673,6 +675,7 @@ pub fn layout_fragment(
 /// in the future, columns will be able to interact (e.g. through floating
 /// figures), so this is already factored out because it'll be conceptually
 /// different from just layouting into more smaller regions.
+#[allow(clippy::too_many_arguments)]
 pub fn layout_fragment_with_columns(
     engine: &mut Engine,
     content: &Content,
@@ -681,6 +684,8 @@ pub fn layout_fragment_with_columns(
     regions: Regions,
     count: NonZeroUsize,
     gutter: Rel<Abs>,
+    balance: bool,
+    location: Option<Location>,
 ) -> SourceResult<Fragment> {
     layout_fragment_impl(
         engine.world,
@@ -694,6 +699,8 @@ pub fn layout_fragment_with_columns(
         regions,
         count,
         gutter,
+        balance,
+        location,
     )
 }
 
@@ -724,6 +731,8 @@ fn layout_fragment_impl(
     regions: Regions,
     columns: NonZeroUsize,
     column_gutter: Rel<Abs>,
+    balance: bool,
+    location: Option<Location>,
 ) -> SourceResult<Fragment> {
     let link = LocatorLink::new(locator);
     let mut locator = Locator::link(&link).split();
@@ -747,7 +756,8 @@ fn layout_fragment_impl(
         styles,
     )?;
 
-    FlowLayouter::new(
+    let mut backlog = Vec::new();
+    let flow_layouter = FlowLayouter::new(
         &mut engine,
         &children,
         &mut locator,
@@ -756,9 +766,21 @@ fn layout_fragment_impl(
         columns,
         column_gutter,
         content.span(),
-        &mut vec![],
-    )
-    .layout(regions)
+        &mut backlog,
+    );
+
+    if balance {
+        assert!(location.is_some());
+
+        BalancedLayouter {
+            inner: flow_layouter,
+            location,
+            column_allowance: 0.,
+        }.layout(regions)
+    } else {
+        flow_layouter.layout(regions)
+    }
+    
 }
 
 /// Layouts a collection of block-level elements.
@@ -984,28 +1006,32 @@ impl<'a, 'b> FlowLayouter<'a, 'b> {
     /// Layout the flow.
     fn layout(mut self, regions: Regions) -> SourceResult<Fragment> {
         for &(child, styles) in self.children {
-            if let Some(elem) = child.to_packed::<TagElem>() {
-                self.handle_tag(elem);
-            } else if let Some(elem) = child.to_packed::<VElem>() {
-                self.handle_v(elem, styles)?;
-            } else if let Some(elem) = child.to_packed::<ColbreakElem>() {
-                self.handle_colbreak(elem)?;
-            } else if let Some(elem) = child.to_packed::<ParElem>() {
-                self.handle_par(elem, styles)?;
-            } else if let Some(elem) = child.to_packed::<BlockElem>() {
-                self.handle_block(elem, styles)?;
-            } else if let Some(elem) = child.to_packed::<PlaceElem>() {
-                self.handle_place(elem, styles)?;
-            } else if let Some(elem) = child.to_packed::<FlushElem>() {
-                self.handle_flush(elem)?;
-            } else if child.is::<PagebreakElem>() {
-                bail!(child.span(), "pagebreaks are not allowed inside of containers");
-            } else {
-                bail!(child.span(), "{} is not allowed here", child.func().name());
-            }
+            self.handle_child(child, styles)?;
         }
-
         self.finish(regions)
+    }
+
+    fn handle_child(&mut self, child: &'a Content, styles: StyleChain<'a>) -> SourceResult<()> {
+        if let Some(elem) = child.to_packed::<TagElem>() {
+            self.handle_tag(elem);
+        } else if let Some(elem) = child.to_packed::<VElem>() {
+            self.handle_v(elem, styles)?;
+        } else if let Some(elem) = child.to_packed::<ColbreakElem>() {
+            self.handle_colbreak(elem)?;
+        } else if let Some(elem) = child.to_packed::<ParElem>() {
+            self.handle_par(elem, styles)?;
+        } else if let Some(elem) = child.to_packed::<BlockElem>() {
+            self.handle_block(elem, styles)?;
+        } else if let Some(elem) = child.to_packed::<PlaceElem>() {
+            self.handle_place(elem, styles)?;
+        } else if let Some(elem) = child.to_packed::<FlushElem>() {
+            self.handle_flush(elem)?;
+        } else if child.is::<PagebreakElem>() {
+            bail!(child.span(), "pagebreaks are not allowed inside of containers");
+        } else {
+            bail!(child.span(), "{} is not allowed here", child.func().name());
+        }
+        Ok(())
     }
 
     /// Place explicit metadata into the flow.
@@ -1965,6 +1991,102 @@ impl<'a, 'b> FlowLayouter<'a, 'b> {
                 _ => {}
             }
         }
+    }
+}
+
+/// Layouts a collection of block-level elements vertically, attempting to
+/// balance them equally across regions.
+struct BalancedLayouter<'a, 'b> {
+    inner: FlowLayouter<'a, 'b>,
+    location: Location,
+    column_allowance: f64,
+}
+
+// ANCHOR: BalancedLayouter
+/*
+https://tex.stackexchange.com/questions/20532/multicols-not-wrapping-to-2nd-column-properly
+
+assumption is that the galley material to cut the columns from has a suitable number of breakpoints to allow for this and inparticular to allow for balancing
+
+Now the balancing algorithm roughly works as follows:
+
+    It measures the whole galley to balance and from that value it deduces a start value for cutting columns of. That start point can be influenced, but that would not help here.
+    It then cuts off the columns and the last one receives all leftover material. It then checks if the height of the last column is higher than that of the first column and if so rejects the solution.
+    It also rejects the current trial if any of the columns have a very high badness (customizable).
+    It also rejects the trial if there have been columnbreaks that were not honored.
+    If the trial was successful the value found will be used, not it will be increased by one point and the algorithm repeats.
+
+If the final value is larger than the available space then multicol attempts to recover by squezing all columns into the available space. With normal text columns that is likely to succeed, as there is usually some shrinkability on the page and with enough breakpoints in the galley the ammount of excess is not likely to be high either.
+*/
+
+impl<'a, 'b> BalancedLayouter<'a, 'b> {
+    fn layout(mut self, regions: Regions) -> SourceResult<Fragment> {
+        self.column_allowance = {
+            let mut result = 0.;
+            for &(child, styles) in self.inner.children {
+                result += self.measure_child(child, styles)?.y.to_raw();
+            }
+            result / self.inner.columns as f64
+        };
+
+        for &(child, styles) in self.inner.children {
+            self.handle_child(child, styles)?;
+        }
+
+        self.inner.finish(regions)
+    }
+
+    fn measure_child(&mut self, child: &'a Content, styles: StyleChain<'a>) -> SourceResult<Size> {
+        let context = Context::new(Some(self.location), Some(styles));
+        let pod = Region::new(
+            self.inner.regions.size,
+            Axes::splat(false),
+        );
+
+        let here = context.location().at(child.span())?;
+        let link = LocatorLink::measure(here);
+        let locator = Locator::link(&link);
+        
+        let frame = layout_frame(self.inner.engine, &child, locator, styles, pod)?;
+        Ok(frame.size())
+    }
+
+    fn handle_child(&mut self, child: &'a Content, styles: StyleChain<'a>) -> SourceResult<()> {
+        if let Some(elem) = child.to_packed::<VElem>() {
+            self.handle_v(elem, styles)?;
+        } else if let Some(elem) = child.to_packed::<ColbreakElem>() {
+            self.handle_colbreak(elem)?;
+        } else if let Some(elem) = child.to_packed::<ParElem>() {
+            self.handle_par(elem, styles)?;
+        } else if let Some(elem) = child.to_packed::<BlockElem>() {
+            self.handle_block(elem, styles)?;
+        } else if let Some(elem) = child.to_packed::<FlushElem>() {
+            self.handle_flush(elem)?;
+        } else {
+            self.inner.handle_child(child, styles)?;
+        }
+        Ok(())
+    }
+    
+    fn handle_v(&mut self, elem: &'a Packed<VElem>, styles: StyleChain) -> SourceResult<()> {
+        self.inner.handle_v(elem, styles)
+    }
+
+    fn handle_colbreak(&mut self, elem: &'a Packed<ColbreakElem>) -> SourceResult<()> {
+        self.inner.handle_colbreak(elem)
+    }
+
+    fn handle_par(&mut self, elem: &'a Packed<ParElem>, styles: StyleChain) -> SourceResult<()> {
+        self.inner.handle_par(elem, styles)
+    }
+
+    fn handle_block(&mut self, elem: &'a Packed<BlockElem>, styles: StyleChain<'a>) -> SourceResult<()> {
+        // TODO: handle breakable properly
+        self.inner.handle_block(elem, styles)
+    }
+
+    fn handle_flush(&mut self, elem: &'a Packed<FlushElem>) -> SourceResult<()> {
+        self.inner.handle_flush(elem)
     }
 }
 

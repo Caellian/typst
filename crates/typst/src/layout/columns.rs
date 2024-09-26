@@ -1,6 +1,6 @@
 use std::num::NonZeroUsize;
 
-use crate::diag::SourceResult;
+use crate::{diag::SourceResult, introspection::Locatable};
 use crate::engine::Engine;
 use crate::foundations::{elem, Content, NativeElement, Packed, Show, StyleChain};
 use crate::introspection::Locator;
@@ -39,7 +39,7 @@ use crate::layout::{
 /// increasingly been used to solve a
 /// variety of problems.
 /// ```
-#[elem(Show)]
+#[elem(Show, Locatable)]
 pub struct ColumnsElem {
     /// The number of columns.
     #[positional]
@@ -50,6 +50,10 @@ pub struct ColumnsElem {
     #[resolve]
     #[default(Ratio::new(0.04).into())]
     pub gutter: Rel<Length>,
+
+    /// Whether column content should be balanced.
+    #[default(false)]
+    pub balanced: bool,
 
     /// The content that should be layouted into the columns.
     #[required]
@@ -82,6 +86,8 @@ fn layout_columns(
         regions,
         elem.count(styles),
         elem.gutter(styles),
+        elem.balanced(styles),
+        elem.location(),
     )
 }
 
